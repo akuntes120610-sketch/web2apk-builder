@@ -1,0 +1,211 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        required: true
+        type: string
+      userId:
+        required: false
+        type: string
+      payload:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout worker repository
+        uses: actions/checkout@v4
+
+      - name: Prepare build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y >/dev/null
+          sudo apt-get install -y unzip imagemagick >/dev/null
+          java -version
+
+      - name: Parse build payload
+        id: payload
+        shell: bash
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$PAYLOAD" > payload.json
+          jq -e . payload.json >/dev/null
+          echo "mode=$(jq -r '.mode // empty' payload.json)" >> "$GITHUB_OUTPUT"
+          echo "appName=$(jq -r '.appName // "My App"' payload.json)" >> "$GITHUB_OUTPUT"
+          echo "buildType=$(jq -r '.buildType // "release"' payload.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Build APK
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD: ${{ inputs.payload }}
+          JOB_ID: ${{ inputs.jobId }}
+        run: |
+          set -euo pipefail
+          MODE="${{ steps.payload.outputs.mode }}"
+          APP_NAME="${{ steps.payload.outputs.appName }}"
+          BUILD_TYPE="${{ steps.payload.outputs.buildType }}"
+          mkdir -p work
+
+          download_asset() {
+            local api_url="$1"
+            local output="$2"
+            test -n "$api_url"
+            curl --fail --location --retry 4 --retry-delay 2 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$api_url" -o "$output"
+            test -s "$output"
+          }
+
+          if [ "$MODE" = "url" ]; then
+            rm -rf work/url-app
+            if [ -d assets/android-native-template-safe ]; then
+              cp -R assets/android-native-template-safe work/url-app
+            else
+              echo "Template Android tidak ada di repository target. Workflow ini membutuhkan assets/android-native-template-safe." >&2
+              exit 3
+            fi
+            URL=$(jq -r '.url // empty' payload.json)
+            test -n "$URL"
+            ENCODED=$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1][::-1].encode()).decode())' "$URL")
+            APP_ESC=$(python3 -c 'import sys,xml.sax.saxutils; print(xml.sax.saxutils.escape(sys.argv[1]))' "$APP_NAME")
+            sed -i "s/ENCODED_URL_PLACEHOLDER/${ENCODED}/g" work/url-app/app/src/main/java/com/web2apk/app/MainActivity.java
+            sed -i "s#<string name=\"app_name\">.*</string>#<string name=\"app_name\">${APP_ESC}</string>#" work/url-app/app/src/main/res/values/strings.xml
+
+            ICON_URL=$(jq -r '.iconAssetUrl // empty' payload.json)
+            if [ -n "$ICON_URL" ]; then
+              download_asset "$ICON_URL" /tmp/icon.jpg
+              for dir in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+                mkdir -p "work/url-app/app/src/main/res/mipmap-$dir"
+                size=48
+                case "$dir" in mdpi) size=48;; hdpi) size=72;; xhdpi) size=96;; xxhdpi) size=144;; xxxhdpi) size=192;; esac
+                convert /tmp/icon.jpg -auto-orient -thumbnail "${size}x${size}^" -gravity center -extent "${size}x${size}" "work/url-app/app/src/main/res/mipmap-$dir/ic_launcher.png"
+                cp "work/url-app/app/src/main/res/mipmap-$dir/ic_launcher.png" "work/url-app/app/src/main/res/mipmap-$dir/ic_launcher_round.png"
+              done
+            fi
+            cd work/url-app
+            chmod +x gradlew
+            ./gradlew --no-daemon --stacktrace "assemble$([ "$BUILD_TYPE" = "debug" ] && echo Debug || echo Release)"
+            APK=$(find app/build/outputs/apk -type f -name '*.apk' | head -1)
+
+          elif [ "$MODE" = "zip" ]; then
+            ZIP_URL=$(jq -r '.zipAssetUrl // empty' payload.json)
+            download_asset "$ZIP_URL" work/project.zip
+            rm -rf work/project
+            mkdir -p work/project
+            unzip -q work/project.zip -d work/project
+            PROJECT=$(find work/project -name pubspec.yaml -o -name settings.gradle -o -name settings.gradle.kts | head -1 | xargs -r dirname)
+            test -n "$PROJECT"
+
+            if [ -f "$PROJECT/pubspec.yaml" ]; then
+              cd "$PROJECT"
+              if ! command -v flutter >/dev/null 2>&1; then
+                git clone --depth 1 https://github.com/flutter/flutter.git "$HOME/flutter"
+                export PATH="$HOME/flutter/bin:$PATH"
+              fi
+              flutter --version
+              flutter pub get
+              if [ "$BUILD_TYPE" = "debug" ]; then flutter build apk --debug; else flutter build apk --release; fi
+              APK=$(find build/app/outputs/flutter-apk -type f -name '*.apk' | head -1)
+            else
+              cd "$PROJECT"
+              chmod +x gradlew || true
+              if [ "$BUILD_TYPE" = "debug" ]; then ./gradlew --no-daemon --stacktrace assembleDebug; else ./gradlew --no-daemon --stacktrace assembleRelease; fi
+              APK=$(find . -path '*/build/outputs/apk/*/*.apk' -type f | head -1)
+            fi
+
+          elif [ "$MODE" = "html" ]; then
+            HTML_URL=$(jq -r '.htmlAssetUrl // empty' payload.json)
+            test -n "$HTML_URL"
+            rm -rf work/flutter-app
+            mkdir -p work/flutter-app
+            if ! command -v flutter >/dev/null 2>&1; then
+              git clone --depth 1 https://github.com/flutter/flutter.git "$HOME/flutter"
+              export PATH="$HOME/flutter/bin:$PATH"
+            fi
+            flutter create --platforms=android --project-name web2apk_app work/flutter-app
+            cd work/flutter-app
+            mkdir -p assets/web
+            download_asset "$HTML_URL" assets/web/index.html
+            ICON_URL=$(jq -r '.iconAssetUrl // empty' payload.json)
+            if [ -n "$ICON_URL" ]; then
+              download_asset "$ICON_URL" /tmp/icon.jpg
+              for dir in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+                mkdir -p "android/app/src/main/res/mipmap-$dir"
+                size=48
+                case "$dir" in mdpi) size=48;; hdpi) size=72;; xhdpi) size=96;; xxhdpi) size=144;; xxxhdpi) size=192;; esac
+                convert /tmp/icon.jpg -auto-orient -thumbnail "${size}x${size}^" -gravity center -extent "${size}x${size}" "android/app/src/main/res/mipmap-$dir/ic_launcher.png"
+                cp "android/app/src/main/res/mipmap-$dir/ic_launcher.png" "android/app/src/main/res/mipmap-$dir/ic_launcher_round.png"
+              done
+            fi
+            python3 - <<'PY'
+            from pathlib import Path
+            p=Path('pubspec.yaml')
+            s=p.read_text()
+            s=s.replace("dependencies:\n", "dependencies:\n  webview_flutter: ^4.13.0\n")
+            s=s.replace("flutter:\n", "flutter:\n  assets:\n    - assets/web/index.html\n")
+            p.write_text(s)
+            PY
+            cat > lib/main.dart <<'DART'
+            import 'package:flutter/material.dart';
+            import 'package:webview_flutter/webview_flutter.dart';
+            
+            void main() => runApp(const Web2ApkApp());
+            
+            class Web2ApkApp extends StatefulWidget {
+              const Web2ApkApp({super.key});
+              @override State<Web2ApkApp> createState() => _Web2ApkAppState();
+            }
+            class _Web2ApkAppState extends State<Web2ApkApp> {
+              late final WebViewController controller;
+              @override void initState() {
+                super.initState();
+                controller = WebViewController()
+                  ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                  ..setNavigationDelegate(NavigationDelegate())
+                  ..loadFlutterAsset('assets/web/index.html');
+              }
+              @override Widget build(BuildContext context) => MaterialApp(
+                debugShowCheckedModeBanner: false,
+                home: Scaffold(
+                  appBar: AppBar(title: const Text('Web2Apk')),
+                  body: WebViewWidget(controller: controller),
+                ),
+              );
+            }
+            DART
+            flutter pub get
+            if [ "$BUILD_TYPE" = "debug" ]; then flutter build apk --debug; else flutter build apk --release; fi
+            APK=$(find build/app/outputs/flutter-apk -type f -name '*.apk' | head -1)
+          else
+            echo "Unsupported build mode: $MODE" >&2
+            exit 2
+          fi
+
+          test -n "${APK:-}" && test -f "$APK"
+          mkdir -p output
+          cp "$APK" "output/apk-${JOB_ID}.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: output/apk-${{ inputs.jobId }}.apk
+          if-no-files-found: error
+          retention-days: 1
