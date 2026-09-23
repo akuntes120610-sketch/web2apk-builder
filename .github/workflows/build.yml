@@ -42,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf project_raw project.zip
-          curl --fail --silent --show-error --location             --retry 5 --retry-all-errors --connect-timeout 20 --max-time 1800             -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}"             -H "Accept: application/octet-stream"             "${{ inputs.zip_url }}" -o project.zip
+          curl --fail --silent --show-error --location             --retry 5 --retry-all-errors --connect-timeout 20 --max-time 1800             -H "Authorization: Bearer ${{ secrets.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 }}"             -H "Accept: application/octet-stream"             "${{ inputs.zip_url }}" -o project.zip
           test -s project.zip
           unzip -tq project.zip
           mkdir -p project_raw
