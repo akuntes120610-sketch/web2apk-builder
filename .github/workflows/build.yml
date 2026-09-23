@@ -1,0 +1,204 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project"
+        required: true
+        type: string
+      tag:
+        description: "Build tag"
+        required: true
+        type: string
+      build_type:
+        description: "release atau debug"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2 -Dorg.gradle.jvmargs=-Xmx4g"
+      CI: "true"
+
+    steps:
+      - name: Checkout helper
+        uses: actions/checkout@v5
+
+      - name: Download project
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf project_raw project.zip
+          curl --fail --silent --show-error --location             --retry 5 --retry-all-errors --connect-timeout 20 --max-time 1800             -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}"             -H "Accept: application/octet-stream"             "${{ inputs.zip_url }}" -o project.zip
+          test -s project.zip
+          unzip -tq project.zip
+          mkdir -p project_raw
+          unzip -q project.zip -d project_raw
+
+      - name: Detect project root
+        id: detect_root
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Scanning extracted project..."
+          find project_raw -maxdepth 5 -type f ( -name "pubspec.yaml" -o -name "gradlew" -o -name "settings.gradle" -o -name "settings.gradle.kts" ) -print | head -50 || true
+
+          ROOT=""
+
+          # Prefer a real Flutter root.
+          while IFS= read -r pubspec; do
+            [ -z "$pubspec" ] && continue
+            candidate="$(dirname "$pubspec")"
+            if [ -d "$candidate/android" ]; then
+              ROOT="$candidate"
+              break
+            fi
+          done < <(find project_raw -type f -name "pubspec.yaml" -print)
+
+          # Flutter project without android directory (flutter can regenerate it).
+          if [ -z "$ROOT" ]; then
+            first_pubspec="$(find project_raw -type f -name "pubspec.yaml" -print -quit || true)"
+            if [ -n "$first_pubspec" ]; then
+              ROOT="$(dirname "$first_pubspec")"
+            fi
+          fi
+
+          # Pure Android fallback.
+          if [ -z "$ROOT" ]; then
+            first_gradle="$(find project_raw -type f -name "gradlew" -print -quit || true)"
+            if [ -n "$first_gradle" ]; then
+              ROOT="$(dirname "$(dirname "$first_gradle")")"
+              [ -f "$ROOT/gradlew" ] || ROOT="$(dirname "$first_gradle")"
+            fi
+          fi
+
+          if [ -z "$ROOT" ]; then
+            echo "::error title=Project root not found::ZIP does not contain pubspec.yaml or an Android Gradle wrapper."
+            echo "PROJECT_ROOT=" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+          ROOT="$(realpath "$ROOT")"
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "project_root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Detected project root: $ROOT"
+          test -f "$ROOT/pubspec.yaml" || test -f "$ROOT/gradlew"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Flutter stable
+        if: env.PROJECT_ROOT != ''
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare project
+        if: env.PROJECT_ROOT != ''
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f pubspec.yaml ]; then
+            flutter --version
+            flutter clean || true
+            flutter pub get
+          fi
+          if [ -f android/gradlew ]; then
+            chmod +x android/gradlew
+          elif [ -f gradlew ]; then
+            chmod +x gradlew
+          fi
+
+      - name: Build APK
+        if: env.PROJECT_ROOT != ''
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f pubspec.yaml ]; then
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              flutter build apk --debug
+            else
+              flutter build apk --release
+            fi
+          elif [ -f gradlew ]; then
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              ./gradlew assembleDebug --no-daemon --stacktrace
+            else
+              ./gradlew assembleRelease --no-daemon --stacktrace
+            fi
+          elif [ -f android/gradlew ]; then
+            cd android
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              ./gradlew assembleDebug --no-daemon --stacktrace
+            else
+              ./gradlew assembleRelease --no-daemon --stacktrace
+            fi
+          else
+            echo "::error::Supported Android/Flutter project files were not found."
+            exit 2
+          fi
+
+      - name: Recovery build
+        if: failure() && env.PROJECT_ROOT != ''
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Primary build failed. Starting clean recovery build..."
+          if [ -f pubspec.yaml ]; then
+            rm -rf .dart_tool build
+            flutter clean || true
+            flutter pub get
+            flutter build apk --release
+          elif [ -f gradlew ]; then
+            ./gradlew clean --no-daemon
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          elif [ -f android/gradlew ]; then
+            cd android
+            ./gradlew clean --no-daemon
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          else
+            exit 2
+          fi
+
+      - name: Locate APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find "$GITHUB_WORKSPACE" -type f -name "*.apk"             ! -path "*/.gradle/*" ! -path "*/.git/*" -print -quit || true)"
+          if [ -z "$APK" ]; then
+            echo "::error title=APK not found::Build finished but no APK was produced."
+            exit 3
+          fi
+          mkdir -p output
+          cp "$APK" output/app.apk
+          ls -lh output/app.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-${{ inputs.build_type }}-${{ inputs.tag }}
+          path: output/app.apk
+          retention-days: 3
+          if-no-files-found: error
